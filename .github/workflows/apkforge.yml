@@ -1,0 +1,72 @@
+name: APKForge
+on:
+  workflow_dispatch:
+    inputs:
+      java:
+        description: JDK version
+        default: '17'
+      release:
+        description: Publish APK in GitHub Releases
+        default: 'false'
+      variant:
+        description: debug or release
+        default: 'debug'
+permissions:
+  contents: write
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: ${{ inputs.java }}
+      - name: Accept SDK licenses
+        run: yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses || true
+      - uses: gradle/actions/setup-gradle@v4
+        if: ${{ hashFiles('gradlew') == '' }}
+        with:
+          gradle-version: '8.7'
+      - name: Build APK
+        env:
+          TASK: ${{ inputs.variant == 'release' && 'assembleRelease' || 'assembleDebug' }}
+        run: |
+          if [ -f ./gradlew ]; then chmod +x ./gradlew; ./gradlew "$TASK" --stacktrace; else gradle "$TASK" --stacktrace; fi
+      - name: Restore signing key
+        if: ${{ inputs.variant == 'release' }}
+        uses: actions/cache@v4
+        with:
+          path: ~/apkforge.jks
+          key: apkforge-keystore-v1
+      - name: Sign release APKs
+        if: ${{ inputs.variant == 'release' }}
+        run: |
+          BT=$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -1)
+          [ -f ~/apkforge.jks ] || keytool -genkeypair -keystore ~/apkforge.jks \
+            -storepass apkforge -keypass apkforge -alias apkforge \
+            -keyalg RSA -keysize 2048 -validity 10000 -dname "CN=APKForge"
+          find . -path '*/build/outputs/apk/*' -name '*.apk' | while read -r f; do
+            out="${f/-unsigned.apk/.apk}"
+            "$BT/zipalign" -f -p 4 "$f" "$f.aligned"
+            "$BT/apksigner" sign --ks ~/apkforge.jks --ks-pass pass:apkforge --key-pass pass:apkforge \
+              --out "$out.signed" "$f.aligned"
+            rm -f "$f" "$f.aligned"
+            mv "$out.signed" "$out"
+          done
+      - uses: actions/upload-artifact@v4
+        with:
+          name: apk
+          path: '**/build/outputs/apk/**/*.apk'
+          if-no-files-found: error
+      - name: Publish GitHub Release
+        if: ${{ inputs.release == 'true' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          mapfile -t FILES < <(find . -path '*/build/outputs/apk/*' -name '*.apk')
+          gh release create "apkforge-${{ github.run_number }}" "${FILES[@]}" \
+            --title "APK ${{ inputs.variant }} (build #${{ github.run_number }})" \
+            --notes "Compilato con APKForge" \
+            --target "${{ github.sha }}"
